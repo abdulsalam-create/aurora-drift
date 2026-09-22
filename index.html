@@ -1,0 +1,510 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Aurora Drift</title>
+<style>
+  :root { color-scheme: dark; }
+  * { margin: 0; box-sizing: border-box; }
+  html, body { height: 100%; overflow: hidden; background: #05060f; font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, sans-serif; }
+  #app { position: fixed; inset: 0; }
+  canvas { display: block; touch-action: none; }
+
+  #ui { position: fixed; inset: 0; pointer-events: none; z-index: 5; display: flex; flex-direction: column; }
+  #title { margin: max(22px, env(safe-area-inset-top)) 0 0 26px; }
+  #title h1 {
+    font-size: clamp(26px, 5vw, 46px); font-weight: 300; letter-spacing: 0.18em;
+    color: #eef2ff; text-transform: uppercase; text-shadow: 0 0 30px rgba(120,150,255,.55);
+  }
+  #title p { margin-top: 6px; color: #9fb0dd; font-size: 13px; letter-spacing: .14em; font-weight: 300; }
+  #hint {
+    margin: auto auto max(26px, env(safe-area-inset-bottom)); color: #8fa0cf; font-size: 12.5px;
+    letter-spacing: .1em; text-align: center; opacity: .85; padding: 0 16px;
+    transition: opacity 1.2s ease; text-shadow: 0 0 14px rgba(0,0,0,.6);
+  }
+  #hint.gone { opacity: 0; }
+
+  #controls { position: fixed; right: 20px; bottom: max(20px, env(safe-area-inset-bottom)); z-index: 6; display: flex; gap: 10px; }
+  .btn {
+    pointer-events: auto; cursor: pointer; border: 1px solid rgba(160,180,255,.28);
+    background: rgba(20,26,54,.42); color: #dce4ff; font: inherit; font-size: 12px; letter-spacing: .12em;
+    padding: 10px 15px; border-radius: 999px; backdrop-filter: blur(9px); text-transform: uppercase;
+    transition: background .25s, border-color .25s, transform .15s;
+  }
+  .btn:hover { background: rgba(60,80,160,.5); border-color: rgba(180,200,255,.6); }
+  .btn:active { transform: scale(.96); }
+  #vrbtn { position: static !important; }
+
+  #loader {
+    position: fixed; inset: 0; z-index: 20; display: grid; place-items: center;
+    background: radial-gradient(circle at 50% 40%, #10132e, #05060f 70%); transition: opacity 1s ease;
+  }
+  #loader .ring { width: 46px; height: 46px; border-radius: 50%; border: 2px solid rgba(150,170,255,.18); border-top-color: #8ea6ff; animation: spin 1s linear infinite; }
+  #loader p { position: absolute; bottom: 40%; margin-top: 90px; color: #7f90c0; letter-spacing: .3em; font-size: 11px; text-transform: uppercase; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  #loader.gone { opacity: 0; pointer-events: none; }
+  #err { position: fixed; inset: 0; z-index: 30; display: none; place-items: center; text-align: center; color: #cdd6ff; padding: 24px; }
+</style>
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+</head>
+<body>
+<div id="app"></div>
+<div id="ui">
+  <div id="title"><h1>Aurora Drift</h1><p>an immersive quiet · webxr</p></div>
+  <div id="hint">drag to look around · click to send a wish of light · press <b>Enter VR</b> with a headset</div>
+</div>
+<div id="controls"></div>
+<div id="loader"><div class="ring"></div><p>gathering light</p></div>
+<div id="err"><div><h1 style="font-weight:300;letter-spacing:.1em">Aurora Drift</h1><p id="errmsg" style="margin-top:12px;color:#9aa8d8"></p></div></div>
+
+<script type="module">
+import * as THREE from 'three';
+import { VRButton } from 'three/addons/webxr/VRButton.js';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+
+// ---------- shared GLSL ----------
+const NOISE = `
+float hash(vec2 p){ return fract(sin(dot(p, vec2(127.1,311.7)))*43758.5453123); }
+float noise(vec2 p){ vec2 i=floor(p), f=fract(p); vec2 u=f*f*(3.0-2.0*f);
+  return mix(mix(hash(i),hash(i+vec2(1,0)),u.x), mix(hash(i+vec2(0,1)),hash(i+vec2(1,1)),u.x), u.y); }
+float fbm(vec2 p){ float v=0.0, a=0.55; for(int i=0;i<5;i++){ v+=a*noise(p); p*=2.02; a*=0.5; } return v; }
+`;
+
+// Three palettes ("times of day"); uniforms are lerped toward the active one.
+const PALETTES = [
+  { name: 'Twilight',
+    zenith:0x0a0a2e, horizon:0x3a2a63, ground:0x120a26, glow:0xff9d6e,
+    auroraA:0x33ffc8, auroraB:0x7b5cff, star:[0xbfe0ff,0xffd5f0,0xd8ffe9,0xffe7c2] },
+  { name: 'Deep Night',
+    zenith:0x03040f, horizon:0x101a44, ground:0x05060f, glow:0x2a3a8a,
+    auroraA:0x3affd0, auroraB:0xd05cff, star:[0x9fd0ff,0xffffff,0xc9b8ff,0x8ffff0] },
+  { name: 'Dawn',
+    zenith:0x1b2350, horizon:0xff8a5c, ground:0x241436, glow:0xffc27a,
+    auroraA:0xff7ad0, auroraB:0x6ad0ff, star:[0xffe6c2,0xffd0e6,0xd9e6ff,0xffffff] },
+];
+
+const app = document.getElementById('app');
+let renderer, scene, camera, player, composer, bloom, clock;
+let stars, auroras = [], sky, sea, lanterns = [], bursts = [];
+const controllers = [];
+const targetCol = {}; // palette uniforms lerp target
+let paletteIdx = 0;
+const pointer = new THREE.Vector2(0, 0);
+const parallax = new THREE.Vector2(0, 0);
+
+init();
+
+function fail(msg){
+  document.getElementById('loader').classList.add('gone');
+  const e = document.getElementById('err'); e.style.display = 'grid';
+  document.getElementById('errmsg').textContent = msg;
+}
+
+function init(){
+  try {
+    renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
+    renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+    renderer.setSize(innerWidth, innerHeight);
+    renderer.outputColorSpace = THREE.SRGBColorSpace;
+    renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    renderer.toneMappingExposure = 1.15;
+    renderer.xr.enabled = true;
+    app.appendChild(renderer.domElement);
+  } catch (e) { fail('WebGL could not start on this device.'); return; }
+
+  scene = new THREE.Scene();
+  scene.fog = new THREE.FogExp2(0x0a0c22, 0.0125);
+  clock = new THREE.Clock();
+
+  camera = new THREE.PerspectiveCamera(62, innerWidth / innerHeight, 0.1, 400);
+  player = new THREE.Group();          // the rig we move; camera + controllers live inside
+  player.add(camera);
+  camera.position.set(0, 1.5, 0);
+  scene.add(player);
+
+  buildSky();
+  buildAurora();
+  buildStars();
+  buildSea();
+  buildLanterns();
+  buildControllers();
+  applyPalette(0, true);
+
+  // bloom (used only in flat/browser mode; XR renders direct so it stays fast and correct)
+  composer = new EffectComposer(renderer);
+  composer.addPass(new RenderPass(scene, camera));
+  bloom = new UnrealBloomPass(new THREE.Vector2(innerWidth, innerHeight), 1.15, 0.72, 0.12);
+  composer.addPass(bloom);
+
+  buildUI();
+  addEventListener('resize', onResize);
+  renderer.domElement.addEventListener('pointermove', onPointer);
+  renderer.domElement.addEventListener('pointerdown', onClick);
+  renderer.xr.addEventListener('sessionstart', () => startAudio());
+
+  setTimeout(() => document.getElementById('loader').classList.add('gone'), 500);
+  renderer.setAnimationLoop(tick);
+}
+
+// ---------- sky dome ----------
+function buildSky(){
+  const uniforms = {
+    uZenith:{value:new THREE.Color()}, uHorizon:{value:new THREE.Color()},
+    uGround:{value:new THREE.Color()}, uGlow:{value:new THREE.Color()}, uTime:{value:0},
+  };
+  targetCol.sky = uniforms;
+  const mat = new THREE.ShaderMaterial({
+    side: THREE.BackSide, depthWrite: false, uniforms,
+    vertexShader: `varying vec3 vDir; void main(){ vDir = normalize(position); gl_Position = projectionMatrix*modelViewMatrix*vec4(position,1.0); }`,
+    fragmentShader: NOISE + `
+      uniform vec3 uZenith,uHorizon,uGround,uGlow; uniform float uTime; varying vec3 vDir;
+      void main(){
+        float t = clamp(vDir.y*0.5+0.5, 0.0, 1.0);
+        vec3 col = t < 0.5 ? mix(uGround, uHorizon, smoothstep(0.0,0.5,t))
+                           : mix(uHorizon, uZenith, smoothstep(0.5,1.0,t));
+        col += uGlow * pow(max(0.0,1.0-abs(vDir.y)), 6.0) * 0.9;            // horizon band
+        float g = fbm(vDir.xz*3.0 + uTime*0.01);                            // faint high cloud
+        col += uHorizon * smoothstep(0.55,1.0,t) * g * 0.12;
+        float stars = smoothstep(0.86,0.995, hash(floor(vDir.xz*260.0))) * smoothstep(0.15,0.9,t);
+        col += vec3(stars) * 0.5;
+        gl_FragColor = vec4(col, 1.0);
+      }`,
+  });
+  sky = new THREE.Mesh(new THREE.SphereGeometry(200, 40, 24), mat);
+  scene.add(sky);
+}
+
+// ---------- aurora curtains ----------
+function buildAurora(){
+  const geo = new THREE.PlaneGeometry(120, 46, 60, 30);
+  for (let i = 0; i < 5; i++){
+    const uniforms = {
+      uTime:{value:0}, uColorA:{value:new THREE.Color()}, uColorB:{value:new THREE.Color()},
+      uSeed:{value:i*13.7}, uIntensity:{value:0.0},
+    };
+    const mat = new THREE.ShaderMaterial({
+      transparent: true, depthWrite: false, blending: THREE.AdditiveBlending, side: THREE.DoubleSide, uniforms,
+      vertexShader: NOISE + `
+        uniform float uTime, uSeed; varying vec2 vUv;
+        void main(){
+          vUv = uv; vec3 p = position;
+          p.z += sin(uv.x*4.0 + uTime*0.35 + uSeed)*3.0 + fbm(vec2(uv.x*3.0+uSeed, uTime*0.1))*4.0;
+          p.x += sin(uTime*0.15 + uSeed)*2.0;
+          gl_Position = projectionMatrix*modelViewMatrix*vec4(p,1.0);
+        }`,
+      fragmentShader: NOISE + `
+        uniform float uTime, uSeed, uIntensity; uniform vec3 uColorA, uColorB; varying vec2 vUv;
+        void main(){
+          float flow = fbm(vec2(vUv.x*5.0 + uSeed, vUv.y*2.2 - uTime*0.18));
+          float curtain = smoothstep(0.25, 0.85, flow);
+          float rays = pow(abs(sin(vUv.x*34.0 + flow*7.0 + uTime*0.2)), 3.0);
+          float vfade = smoothstep(0.0,0.35,vUv.y) * smoothstep(1.0,0.55,vUv.y);
+          vec3 col = mix(uColorA, uColorB, vUv.y*0.7 + flow*0.4);
+          float a = curtain * vfade * (0.35 + rays*0.65) * uIntensity;
+          gl_FragColor = vec4(col * a * 1.8, a);
+        }`,
+    });
+    const m = new THREE.Mesh(geo, mat);
+    const ang = (i / 5) * Math.PI * 2;
+    m.position.set(Math.sin(ang) * 60, 30 + i * 3, -Math.cos(ang) * 60);
+    m.lookAt(0, 24, 0);
+    m.rotateY(Math.PI);
+    scene.add(m);
+    auroras.push(m);
+  }
+}
+
+// ---------- stardust ----------
+function buildStars(){
+  const N = 42000;
+  const pos = new Float32Array(N * 3), col = new Float32Array(N * 3);
+  const scale = new Float32Array(N), phase = new Float32Array(N);
+  const c = new THREE.Color();
+  const pal = PALETTES[0].star;
+  for (let i = 0; i < N; i++){
+    // fill a large flattened sphere shell around the viewer
+    const r = 6 + Math.pow(Math.random(), 0.6) * 90;
+    const th = Math.random() * Math.PI * 2, ph = Math.acos(2 * Math.random() - 1);
+    pos[i*3]   = Math.sin(ph) * Math.cos(th) * r;
+    pos[i*3+1] = (Math.cos(ph) * r) * 0.55 + 6;         // flatten vertically, lift up
+    pos[i*3+2] = Math.sin(ph) * Math.sin(th) * r;
+    c.setHex(pal[i % pal.length]);
+    col[i*3] = c.r; col[i*3+1] = c.g; col[i*3+2] = c.b;
+    scale[i] = 0.4 + Math.random() * 1.8;
+    phase[i] = Math.random() * 6.283;
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  g.setAttribute('aColor', new THREE.BufferAttribute(col, 3));
+  g.setAttribute('aScale', new THREE.BufferAttribute(scale, 1));
+  g.setAttribute('aPhase', new THREE.BufferAttribute(phase, 1));
+  const uniforms = { uTime:{value:0}, uSize:{value:38}, uAttract:{value:new THREE.Vector3(0,-999,0)}, uAmt:{value:0} };
+  targetCol.stars = uniforms;
+  const mat = new THREE.ShaderMaterial({
+    transparent: true, depthWrite: false, blending: THREE.AdditiveBlending, uniforms,
+    vertexShader: `
+      uniform float uTime, uSize, uAmt; uniform vec3 uAttract;
+      attribute float aScale, aPhase; attribute vec3 aColor;
+      varying vec3 vColor; varying float vTw;
+      void main(){
+        vColor = aColor; vec3 p = position;
+        p.x += sin(uTime*0.10 + p.z*0.14 + aPhase)*0.7;
+        p.y += cos(uTime*0.08 + p.x*0.12 + aPhase)*0.6 + sin(uTime*0.05+aPhase)*0.4;
+        p.z += cos(uTime*0.09 + p.y*0.10 + aPhase)*0.7;
+        vec3 toA = uAttract - p; float d = length(toA);
+        p += normalize(toA) * uAmt * smoothstep(9.0, 0.0, d) * 1.6;         // reach pulls nearby dust
+        vec4 mv = modelViewMatrix * vec4(p, 1.0);
+        vTw = 0.55 + 0.45*sin(uTime*1.6 + aPhase*6.0);
+        gl_PointSize = uSize * aScale * vTw * (300.0 / max(0.001, -mv.z));
+        gl_Position = projectionMatrix * mv;
+      }`,
+    fragmentShader: `
+      varying vec3 vColor; varying float vTw;
+      void main(){
+        vec2 uv = gl_PointCoord - 0.5; float d = length(uv);
+        float a = smoothstep(0.5, 0.0, d); a *= a;
+        gl_FragColor = vec4(vColor * (1.3 + vTw*0.5), a);
+      }`,
+  });
+  stars = new THREE.Points(g, mat);
+  stars.frustumCulled = false;
+  scene.add(stars);
+}
+
+// ---------- reflective sea ----------
+function buildSea(){
+  const uniforms = {
+    uTime:{value:0}, uZenith:{value:new THREE.Color()}, uHorizon:{value:new THREE.Color()},
+    uAuroraA:{value:new THREE.Color()}, uAuroraB:{value:new THREE.Color()}, uGlow:{value:new THREE.Color()},
+  };
+  targetCol.sea = uniforms;
+  const mat = new THREE.ShaderMaterial({
+    transparent: true, uniforms,
+    vertexShader: `varying vec3 vW; void main(){ vec4 w = modelMatrix*vec4(position,1.0); vW = w.xyz; gl_Position = projectionMatrix*viewMatrix*w; }`,
+    fragmentShader: NOISE + `
+      uniform float uTime; uniform vec3 uZenith,uHorizon,uAuroraA,uAuroraB,uGlow; varying vec3 vW;
+      void main(){
+        vec3 v = normalize(cameraPosition - vW);
+        float fres = pow(1.0 - max(0.0, v.y), 3.0);                          // grazing angle = brighter
+        float ripple = fbm(vW.xz*0.10 + uTime*0.05) + fbm(vW.xz*0.4 - uTime*0.08)*0.5;
+        vec3 sky = mix(uHorizon, uZenith, clamp(ripple*0.6,0.0,1.0));
+        float band = smoothstep(0.35,0.0,abs(fract(ripple*3.0)-0.5));        // shimmering aurora reflection
+        vec3 aur = mix(uAuroraA, uAuroraB, ripple) * band * 0.6;
+        vec3 col = mix(vec3(0.01,0.015,0.04), sky, fres) + aur * fres + uGlow*0.05;
+        float spark = pow(noise(vW.xz*3.0 - uTime*0.3), 24.0) * 2.0;         // pinpoint glints
+        col += vec3(spark);
+        float dist = length(cameraPosition.xz - vW.xz);
+        gl_FragColor = vec4(col, mix(0.92, 0.55, smoothstep(10.0, 130.0, dist)));
+      }`,
+  });
+  sea = new THREE.Mesh(new THREE.PlaneGeometry(600, 600, 1, 1), mat);
+  sea.rotation.x = -Math.PI / 2;
+  sea.position.y = -7;
+  scene.add(sea);
+}
+
+// ---------- floating lanterns ----------
+function buildLanterns(){
+  const sphere = new THREE.SphereGeometry(0.26, 20, 16);
+  const haloTex = makeHalo();
+  for (let i = 0; i < 22; i++){
+    const g = new THREE.Group();
+    const hue = 0.06 + Math.random() * 0.09;                    // warm amber lanterns
+    const c = new THREE.Color().setHSL(hue, 0.9, 0.62);
+    const core = new THREE.Mesh(sphere, new THREE.MeshBasicMaterial({ color: c }));
+    const halo = new THREE.Sprite(new THREE.SpriteMaterial({ map: haloTex, color: c, blending: THREE.AdditiveBlending, transparent: true, depthWrite: false }));
+    halo.scale.setScalar(3.4);
+    g.add(core); g.add(halo);
+    const a = Math.random() * Math.PI * 2, r = 8 + Math.random() * 42;
+    g.position.set(Math.cos(a) * r, -3 + Math.random() * 16, Math.sin(a) * r * 0.9);
+    g.userData = { base: g.position.y, sp: 0.3 + Math.random() * 0.6, ph: Math.random() * 6.28, amp: 0.4 + Math.random() * 0.9 };
+    scene.add(g); lanterns.push(g);
+  }
+}
+
+function makeHalo(){
+  const s = 128, cv = document.createElement('canvas'); cv.width = cv.height = s;
+  const x = cv.getContext('2d'); const grd = x.createRadialGradient(s/2, s/2, 0, s/2, s/2, s/2);
+  grd.addColorStop(0, 'rgba(255,255,255,1)'); grd.addColorStop(0.25, 'rgba(255,240,220,.55)');
+  grd.addColorStop(1, 'rgba(255,240,220,0)');
+  x.fillStyle = grd; x.fillRect(0, 0, s, s);
+  const t = new THREE.CanvasTexture(cv); t.colorSpace = THREE.SRGBColorSpace; return t;
+}
+
+// ---------- controllers (VR wands that trail light) ----------
+function buildControllers(){
+  const haloTex = makeHalo();
+  for (let i = 0; i < 2; i++){
+    const ctrl = renderer.xr.getController(i);
+    const tip = new THREE.Mesh(new THREE.SphereGeometry(0.03, 16, 12), new THREE.MeshBasicMaterial({ color: 0xbfe0ff }));
+    const halo = new THREE.Sprite(new THREE.SpriteMaterial({ map: haloTex, color: 0x9fd0ff, blending: THREE.AdditiveBlending, transparent: true, depthWrite: false }));
+    halo.scale.setScalar(0.5); ctrl.add(tip); ctrl.add(halo);
+    ctrl.userData.reach = 0;
+    ctrl.addEventListener('selectstart', () => { ctrl.userData.reach = 1; spawnBurst(ctrl.getWorldPosition(new THREE.Vector3()), 0x9fd0ff); startAudio(); });
+    ctrl.addEventListener('selectend', () => { ctrl.userData.reach = 0; });
+    player.add(ctrl);
+    controllers.push(ctrl);
+  }
+}
+
+// ---------- light bursts ----------
+function spawnBurst(at, color){
+  if (bursts.length > 8) return;
+  const N = 500;
+  const pos = new Float32Array(N * 3), vel = [];
+  for (let i = 0; i < N; i++){
+    const dir = new THREE.Vector3().randomDirection().multiplyScalar(1.4 + Math.random() * 3.5);
+    vel.push(dir); pos[i*3] = at.x; pos[i*3+1] = at.y; pos[i*3+2] = at.z;
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  const mat = new THREE.PointsMaterial({ color, size: 0.16, transparent: true, opacity: 1, blending: THREE.AdditiveBlending, depthWrite: false });
+  const p = new THREE.Points(g, mat); p.frustumCulled = false;
+  p.userData = { vel, life: 0 };
+  scene.add(p); bursts.push(p);
+}
+
+function updateBursts(dt){
+  for (let i = bursts.length - 1; i >= 0; i--){
+    const b = bursts[i]; b.userData.life += dt;
+    const arr = b.geometry.attributes.position.array, v = b.userData.vel;
+    for (let j = 0; j < v.length; j++){
+      arr[j*3] += v[j].x * dt; arr[j*3+1] += v[j].y * dt - dt * 0.4; arr[j*3+2] += v[j].z * dt;
+      v[j].multiplyScalar(0.96);
+    }
+    b.geometry.attributes.position.needsUpdate = true;
+    b.material.opacity = Math.max(0, 1 - b.userData.life / 2.4);
+    b.material.size = 0.16 + b.userData.life * 0.05;
+    if (b.userData.life > 2.4){ scene.remove(b); b.geometry.dispose(); b.material.dispose(); bursts.splice(i, 1); }
+  }
+}
+
+// ---------- palette ----------
+function applyPalette(idx, instant){
+  paletteIdx = ((idx % PALETTES.length) + PALETTES.length) % PALETTES.length;
+  const p = PALETTES[paletteIdx];
+  const set = (uni, key, hex) => { uni[key]._t = new THREE.Color(hex); };
+  const sk = targetCol.sky; set(sk,'uZenith',p.zenith); set(sk,'uHorizon',p.horizon); set(sk,'uGround',p.ground); set(sk,'uGlow',p.glow);
+  const se = targetCol.sea; set(se,'uZenith',p.zenith); set(se,'uHorizon',p.horizon); set(se,'uAuroraA',p.auroraA); set(se,'uAuroraB',p.auroraB); set(se,'uGlow',p.glow);
+  auroras.forEach((m, i) => { m.material.uniforms.uColorA.value._t = new THREE.Color(i % 2 ? p.auroraB : p.auroraA);
+                              m.material.uniforms.uColorB.value._t = new THREE.Color(i % 2 ? p.auroraA : p.auroraB); });
+  if (instant){
+    stepColors(targetCol.sky, 1); stepColors(targetCol.sea, 1);
+    auroras.forEach(m => stepColors(m.material.uniforms, 1));
+  }
+}
+
+// uniforms here are raw { name: { value } } maps; lerp any Color that has a target ._t
+function stepColors(uni, f){ for (const k in uni){ const val = uni[k].value; if (val && val.isColor && val._t) val.lerp(val._t, f); } }
+
+// ---------- loop ----------
+function tick(){
+  const dt = Math.min(clock.getDelta(), 0.05), t = clock.elapsedTime;
+  const presenting = renderer.xr.isPresenting;
+
+  // ease palette colors
+  const f = 1 - Math.pow(0.001, dt);
+  stepColors(targetCol.sky, f); stepColors(targetCol.sea, f);
+  auroras.forEach(m => stepColors(m.material.uniforms, f));
+
+  // animate uniforms
+  sky.material.uniforms.uTime.value = t;
+  sea.material.uniforms.uTime.value = t;
+  stars.material.uniforms.uTime.value = t;
+  auroras.forEach((m, i) => { m.material.uniforms.uTime.value = t;
+    m.material.uniforms.uIntensity.value += ((0.7 + 0.3 * Math.sin(t * 0.2 + i)) - m.material.uniforms.uIntensity.value) * 0.02; });
+
+  lanterns.forEach(l => { const u = l.userData; l.position.y = u.base + Math.sin(t * u.sp + u.ph) * u.amp; });
+
+  updateBursts(dt);
+
+  // reach attraction (controllers pulling stardust in VR)
+  let reach = 0, rp = null;
+  controllers.forEach(c => { if (c.userData.reach > 0){ reach = 1; rp = c.getWorldPosition(new THREE.Vector3()); } });
+  const su = stars.material.uniforms;
+  su.uAmt.value += ((reach ? 1 : 0) - su.uAmt.value) * 0.08;
+  if (rp) su.uAttract.value.copy(rp);
+
+  if (!presenting){
+    // gentle cinematic drift + pointer parallax when in a flat browser
+    parallax.lerp(pointer, 0.05);
+    const rad = 13 + Math.sin(t * 0.05) * 2.5;
+    player.position.set(Math.sin(t * 0.03) * rad, 1.2 + Math.sin(t * 0.07) * 0.6, Math.cos(t * 0.03) * rad);
+    camera.position.set(0, 1.5, 0);
+    const look = new THREE.Vector3(-player.position.x + parallax.x * 8, 6 + parallax.y * 4, -player.position.z + 4);
+    camera.lookAt(player.position.clone().add(look.sub(player.position).normalize().multiplyScalar(30)));
+    composer.render();
+  } else {
+    renderer.render(scene, camera);
+  }
+}
+
+// ---------- input / ui ----------
+function onPointer(e){ pointer.x = (e.clientX / innerWidth) * 2 - 1; pointer.y = -((e.clientY / innerHeight) * 2 - 1); hideHint(); }
+function onClick(e){
+  hideHint(); startAudio();
+  const ndc = new THREE.Vector2((e.clientX/innerWidth)*2-1, -((e.clientY/innerHeight)*2-1));
+  const ray = new THREE.Raycaster(); ray.setFromCamera(ndc, camera);
+  const at = ray.ray.origin.clone().add(ray.ray.direction.clone().multiplyScalar(14));
+  spawnBurst(at, 0xbfe0ff);
+}
+let hintGone = false;
+function hideHint(){ if (hintGone) return; hintGone = true; document.getElementById('hint').classList.add('gone'); }
+
+function onResize(){
+  camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight); composer.setSize(innerWidth, innerHeight);
+}
+
+function buildUI(){
+  const controls = document.getElementById('controls');
+  const sound = document.createElement('button'); sound.className = 'btn'; sound.textContent = 'Sound';
+  sound.onclick = () => { startAudio(); toggleAudio(sound); };
+  const shift = document.createElement('button'); shift.className = 'btn'; shift.textContent = 'Shift sky';
+  shift.onclick = () => applyPalette(paletteIdx + 1);
+  const vr = VRButton.createButton(renderer); vr.id = 'vrbtn'; vr.classList.add('btn');
+  controls.append(shift, sound, vr);
+}
+
+// ---------- generative ambient audio ----------
+let actx, master, audioOn = false, audioStarted = false;
+function startAudio(){
+  if (audioStarted) return; audioStarted = true;
+  try {
+    actx = new (window.AudioContext || window.webkitAudioContext)();
+    master = actx.createGain(); master.gain.value = 0.0; master.connect(actx.destination);
+    // slow evolving pad from a few detuned oscillators through a soft filter
+    const filt = actx.createBiquadFilter(); filt.type = 'lowpass'; filt.frequency.value = 700; filt.Q.value = 0.6; filt.connect(master);
+    const freqs = [110, 164.81, 220, 277.18];
+    freqs.forEach((fq, i) => {
+      const o = actx.createOscillator(); o.type = i % 2 ? 'sine' : 'triangle'; o.frequency.value = fq;
+      const g = actx.createGain(); g.gain.value = 0.0; o.connect(g); g.connect(filt);
+      const lfo = actx.createOscillator(); lfo.frequency.value = 0.03 + i * 0.017;
+      const lg = actx.createGain(); lg.gain.value = 0.05; lfo.connect(lg); lg.connect(g.gain);
+      o.start(); lfo.start(); g.gain.setValueAtTime(0.0, actx.currentTime); g.gain.linearRampToValueAtTime(0.12, actx.currentTime + 6);
+      o.detune.value = (Math.random() - 0.5) * 8;
+    });
+    // slow filter sweep for movement
+    const sweep = actx.createOscillator(); sweep.frequency.value = 0.015;
+    const sg = actx.createGain(); sg.gain.value = 380; sweep.connect(sg); sg.connect(filt.frequency); sweep.start();
+    audioOn = true; master.gain.linearRampToValueAtTime(0.5, actx.currentTime + 4);
+  } catch (e) { /* audio optional */ }
+}
+function toggleAudio(btn){
+  if (!actx) return; audioOn = !audioOn;
+  master.gain.linearRampToValueAtTime(audioOn ? 0.5 : 0.0, actx.currentTime + 0.6);
+  btn.style.opacity = audioOn ? 1 : 0.5;
+}
+</script>
+</body>
+</html>
